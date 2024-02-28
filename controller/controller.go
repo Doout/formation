@@ -11,7 +11,9 @@ import (
 	jsonpatchv2 "gomodules.xyz/jsonpatch/v2"
 	"k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -87,10 +89,17 @@ func (c Controller) Reconcile(ctx context.Context, list []types.Resource) (resul
 			if patch == nil {
 				patch = client.MergeFrom(c.object.DeepCopyObject().(client.Object))
 			}
+			kinds, _, err := (*c.scheme).ObjectKinds(res.Runtime())
+			if err != nil || len(kinds) == 0 {
+				log.Error().Caller().Err(err).Msg("unable to get object kind")
+				return ctrl.Result{}, err
+			}
 			rs := &types.ResourceStatus{
-				Name:  res.Name(),
-				Type:  res.Type(),
-				State: types.Creating,
+				Name:       res.Name(),
+				Type:       res.Type(),
+				ApiVersion: kinds[0].Version,
+				Group:      kinds[0].Group,
+				State:      types.Creating,
 			}
 			resourcesStatus = append(resourcesStatus, rs)
 		}
@@ -132,15 +141,33 @@ func (c Controller) Reconcile(ctx context.Context, list []types.Resource) (resul
 		return ctrl.Result{Requeue: true}, c.cli.Status().Patch(ctx, c.object, patch)
 	}
 
-	for idx, res := range status.Resources {
+	for idx := 0; idx < len(status.Resources); idx++ {
+		res := status.Resources[idx]
+
 		copyInstance := c.object.DeepCopyObject().(client.Object)
 		if res == nil {
 			continue
 		}
 		key := strings.ToLower(res.Type + "/" + res.Name)
 		resource, ok := resourceMap[key]
+		// Handle status found but no resource found, can happen due to the resource being removed from the resource list
 		if !ok {
-			//TODO handle the case where we have a status for no resource. This can happen due to resource being removed from the list.
+			// Get the unstructured resource from the status and delete the resource from the API server and status
+			obj := c.getUnstructuredObject(res)
+			err = c.cli.Delete(ctx, obj)
+			// The resource could still be in use, or we don't have permission to delete it
+			if err != nil && !errors.IsNotFound(err) {
+				log.Error().Caller().Err(err).Msg("unable to delete resource")
+				continue
+			}
+			// Remove the resource from the status if successfully deleted or not found
+			removeResourceFromStatus(status, idx)
+			if err = c.cli.Status().Patch(ctx, c.object, client.MergeFrom(copyInstance)); err != nil {
+				log.Error().Caller().Err(err).Msg("unable to update formation status")
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+			}
+			// Decrement the index to avoid skipping the next resource
+			idx--
 			continue
 		}
 		change, err := c.reconcileObject(ctx, resource, c.object, c.object.GetNamespace())
@@ -259,6 +286,14 @@ func nextGroupIDFromList(statusList []*types.ResourceStatus, resourceMap map[str
 	return 0
 }
 
+func removeResourceFromStatus(status *types.FormationStatus, idx int) {
+	res := status.Resources[:idx]
+	if idx+1 < len(status.Resources) {
+		res = append(res, status.Resources[idx+1:]...)
+	}
+	status.Resources = res
+}
+
 // ReconcileObject In some cases, we want to reconcile a single object without the need to reconcile the whole formation.
 // This will bypass the status check and will only check if the object exists and if not, create it.
 // All the other logic will be the same as the Reconcile method.
@@ -281,6 +316,24 @@ func (c Controller) createRuntimeObject(ctx context.Context, resource types.Reso
 		obj.SetAnnotations(map[string]string{})
 	}
 	return obj, nil
+}
+
+func (c Controller) getUnstructuredObject(res *types.ResourceStatus) *unstructured.Unstructured {
+	gvk := schema.GroupVersionKind{
+		Group:   res.Group,
+		Version: res.ApiVersion,
+		Kind:    res.Type,
+	}
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": gvk.GroupVersion().String(),
+			"kind":       gvk.Kind,
+			"metadata": map[string]interface{}{
+				"name":      res.Name,
+				"namespace": c.object.GetNamespace(),
+			},
+		},
+	}
 }
 
 func (c Controller) reconcileObject(ctx context.Context, resource types.Resource, owner v1.Object, namespace string) (bool, error) {
