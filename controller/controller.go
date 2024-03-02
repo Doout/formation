@@ -95,11 +95,10 @@ func (c Controller) Reconcile(ctx context.Context, list []types.Resource) (resul
 				return ctrl.Result{}, err
 			}
 			rs := &types.ResourceStatus{
-				Name:       res.Name(),
-				Type:       res.Type(),
-				ApiVersion: kinds[0].Version,
-				Group:      kinds[0].Group,
-				State:      types.Creating,
+				Name:  res.Name(),
+				Type:  res.Type(),
+				Group: kinds[0].Group,
+				State: types.Creating,
 			}
 			resourcesStatus = append(resourcesStatus, rs)
 		}
@@ -150,20 +149,27 @@ func (c Controller) Reconcile(ctx context.Context, list []types.Resource) (resul
 		}
 		key := strings.ToLower(res.Type + "/" + res.Name)
 		resource, ok := resourceMap[key]
+
 		// Handle status found but no resource found, can happen due to the resource being removed from the resource list
 		if !ok {
-			// Get the unstructured resource from the status and delete the resource from the API server and status
-			obj := c.getUnstructuredObject(res)
-			err = c.cli.Delete(ctx, obj)
-			// The resource could still be in use, or we don't have permission to delete it
-			if err != nil && !errors.IsNotFound(err) {
-				log.Error().Caller().Err(err).Msg("unable to delete resource")
-				continue
+			// Get the unstructured resources matching the resource from status and delete them from the API server and status
+			// If no resources are found, remove the resource from the status and continue
+			resources := c.getUnstructuredObjects(res)
+
+			// For each resource, delete it from the API server
+			// Multiple resources can be returned if the resource has multiple versions
+			for _, res := range resources {
+				err := c.cli.Delete(ctx, res)
+				// The resource could still be in use, or we don't have permission to delete it
+				if err != nil && !errors.IsNotFound(err) {
+					log.Error().Caller().Err(err).Msg("unable to delete resource")
+					continue
+				}
 			}
-			// Remove the resource from the status if successfully deleted or not found
+			// Remove the resource from status if successfully deleted or not found
 			removeResourceFromStatus(status, idx)
 			if err = c.cli.Status().Patch(ctx, c.object, client.MergeFrom(copyInstance)); err != nil {
-				log.Error().Caller().Err(err).Msg("unable to update formation status")
+				log.Error().Err(err).Msg("unable to update formation status")
 				return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 			}
 			// Decrement the index to avoid skipping the next resource
@@ -318,12 +324,21 @@ func (c Controller) createRuntimeObject(ctx context.Context, resource types.Reso
 	return obj, nil
 }
 
-func (c Controller) getUnstructuredObject(res *types.ResourceStatus) *unstructured.Unstructured {
-	gvk := schema.GroupVersionKind{
-		Group:   res.Group,
-		Version: res.ApiVersion,
-		Kind:    res.Type,
+// getUnstructuredObjects returns a list of unstructured objects for the given resource status
+func (c Controller) getUnstructuredObjects(res *types.ResourceStatus) []*unstructured.Unstructured {
+	var resources []*unstructured.Unstructured
+
+	for t := range c.scheme.AllKnownTypes() {
+		if t.Kind == res.Type && t.Group == res.Group {
+			resources = append(resources, c.getUnstructuredObject(res, &t))
+			break
+		}
 	}
+	return resources
+}
+
+// getUnstructuredObject returns an unstructured object for the given resource status and group version kind
+func (c Controller) getUnstructuredObject(res *types.ResourceStatus, gvk *schema.GroupVersionKind) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": gvk.GroupVersion().String(),
